@@ -1,0 +1,240 @@
+// Prisma schema for the CodeMentorly 1:1 consulting/booking platform.
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Admin user (single-tenant admin dashboard auth)
+// ---------------------------------------------------------------------------
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  name         String
+  passwordHash String
+  role         UserRole @default(ADMIN)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([email])
+}
+
+enum UserRole {
+  ADMIN
+}
+
+// ---------------------------------------------------------------------------
+// Offerings (services that can be booked)
+// ---------------------------------------------------------------------------
+model Offering {
+  id             String   @id @default(cuid())
+  slug           String   @unique
+  name           String
+  tagline        String
+  description    String
+  audience       String // "Who it's for"
+  deliverables   String[] // "What the client gets"
+  priceCents     Int
+  currency       String   @default("usd")
+  durationMinutes Int
+  isActive       Boolean  @default(true)
+  sortOrder      Int      @default(0)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  bookings Booking[]
+
+  @@index([isActive, sortOrder])
+}
+
+// ---------------------------------------------------------------------------
+// Availability configuration
+// ---------------------------------------------------------------------------
+model AvailabilityRule {
+  id          String   @id @default(cuid())
+  dayOfWeek   Int // 0 = Sunday ... 6 = Saturday
+  startTime   String // "10:00" (24h, in `timezone` below)
+  endTime     String // "19:00"
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@unique([dayOfWeek, startTime, endTime])
+  @@index([dayOfWeek, isActive])
+}
+
+model AvailabilitySettings {
+  id                 String   @id @default(cuid())
+  timezone           String   @default("Asia/Kolkata")
+  bufferMinutes      Int      @default(15)
+  minNoticeHours      Int      @default(12)
+  maxAdvanceDays     Int      @default(45)
+  meetingUrlTemplate String? // e.g. a static Meet/Zoom link or template
+  updatedAt          DateTime @updatedAt
+}
+
+// A one-off blocked date/time range (holidays, vacations, etc.)
+model DateOverride {
+  id        String   @id @default(cuid())
+  date      DateTime @db.Date
+  isBlocked Boolean  @default(true)
+  reason    String?
+  createdAt DateTime @default(now())
+
+  @@unique([date])
+  @@index([date])
+}
+
+// ---------------------------------------------------------------------------
+// Customers (lightweight — guest booking, no account required)
+// ---------------------------------------------------------------------------
+model Customer {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  fullName  String
+  company   String?
+  linkedinOrGithub String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  bookings Booking[]
+
+  @@index([email])
+}
+
+// ---------------------------------------------------------------------------
+// Bookings
+// ---------------------------------------------------------------------------
+enum BookingStatus {
+  PENDING // checkout created, payment not confirmed yet
+  CONFIRMED // payment succeeded
+  CANCELLED
+  COMPLETED
+  REFUNDED
+}
+
+model Booking {
+  id              String        @id @default(cuid())
+  bookingNumber   String        @unique // human-friendly reference, e.g. CM-A1B2C3
+
+  offeringId      String
+  offering        Offering      @relation(fields: [offeringId], references: [id], onDelete: Restrict)
+
+  customerId      String
+  customer        Customer      @relation(fields: [customerId], references: [id], onDelete: Restrict)
+
+  startsAt        DateTime // UTC instant
+  endsAt          DateTime // UTC instant (startsAt + offering.durationMinutes)
+  timezone        String // customer-facing timezone label at time of booking
+
+  topic           String // "What would you like help with?"
+  notes           String? // meeting notes/context
+  status          BookingStatus @default(PENDING)
+
+  meetingUrl      String?
+
+  priceCents      Int // snapshot of price paid
+  currency        String        @default("usd")
+
+  cancelledAt     DateTime?
+  cancellationReason String?
+  completedAt     DateTime?
+
+  payment         Payment?
+  notifications   Notification[]
+
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  // A DB-level partial unique index (see migration
+  // `add_active_booking_unique_index`) enforces that only one PENDING/
+  // CONFIRMED booking can exist per (offeringId, startsAt); it deliberately
+  // excludes CANCELLED/COMPLETED/REFUNDED so a freed slot can be rebooked.
+  // Combined with the serializable-transaction overlap check in
+  // booking-service.ts, this closes the race-condition window on double
+  // booking.
+  @@index([offeringId, startsAt])
+  @@index([startsAt])
+  @@index([status])
+  @@index([customerId])
+  @@index([status, startsAt])
+}
+
+// ---------------------------------------------------------------------------
+// Payments
+// ---------------------------------------------------------------------------
+enum PaymentStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+  EXPIRED
+  REFUNDED
+}
+
+enum PaymentProvider {
+  STRIPE
+  MOCK
+}
+
+model Payment {
+  id                    String          @id @default(cuid())
+  bookingId             String          @unique
+  booking               Booking         @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+
+  provider              PaymentProvider @default(MOCK)
+  status                PaymentStatus   @default(PENDING)
+
+  amountCents           Int
+  currency              String          @default("usd")
+
+  stripeCheckoutSessionId String?       @unique
+  stripePaymentIntentId  String?        @unique
+
+  failureReason         String?
+
+  createdAt             DateTime        @default(now())
+  updatedAt              DateTime       @updatedAt
+
+  @@index([status])
+  @@index([stripeCheckoutSessionId])
+}
+
+// ---------------------------------------------------------------------------
+// Notifications (email delivery log)
+// ---------------------------------------------------------------------------
+enum NotificationType {
+  BOOKING_CONFIRMATION_CUSTOMER
+  PAYMENT_CONFIRMATION_CUSTOMER
+  REMINDER_CUSTOMER
+  CANCELLATION_CUSTOMER
+  RESCHEDULE_CUSTOMER
+  NEW_BOOKING_ADMIN
+  CANCELLATION_ADMIN
+}
+
+enum NotificationStatus {
+  PENDING
+  SENT
+  FAILED
+  SKIPPED
+}
+
+model Notification {
+  id        String             @id @default(cuid())
+  bookingId String
+  booking   Booking            @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+
+  type      NotificationType
+  recipient String
+  status    NotificationStatus @default(PENDING)
+  error     String?
+  sentAt    DateTime?
+  createdAt DateTime           @default(now())
+
+  @@index([bookingId])
+  @@index([type, status])
+}
